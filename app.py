@@ -11,6 +11,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 import altair as alt
+from pandas.errors import EmptyDataError
 
 try:
     import boto3
@@ -628,7 +629,13 @@ def load_data_from_spaces(config: Optional[dict[str, str]] = None) -> tuple[Opti
     csv_bytes = data.read()
     if not csv_bytes:
         return empty_frame().copy(), last_modified_ts
-    return prepare_data_frame(pd.read_csv(io.BytesIO(csv_bytes))), last_modified_ts
+    try:
+        return prepare_data_frame(pd.read_csv(io.BytesIO(csv_bytes))), last_modified_ts
+    except EmptyDataError:
+        return empty_frame().copy(), last_modified_ts
+    except Exception:
+        st.warning("Unable to parse CSV from DigitalOcean Spaces.")
+        return None, last_modified_ts
 
 
 def save_data_to_spaces(df: pd.DataFrame, config: Optional[dict[str, str]] = None) -> bool:
@@ -654,7 +661,15 @@ def load_data() -> pd.DataFrame:
     local_df = empty_frame().copy()
     local_modified = None
     if os.path.exists(DATA_PATH):
-        local_df = prepare_data_frame(pd.read_csv(DATA_PATH))
+        try:
+            local_df = prepare_data_frame(pd.read_csv(DATA_PATH))
+        except EmptyDataError:
+            local_df = empty_frame().copy()
+            os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+            local_df.to_csv(DATA_PATH, index=False)
+        except Exception:
+            st.warning("Local CSV could not be read. Starting with an empty dataset.")
+            local_df = empty_frame().copy()
         local_modified = os.path.getmtime(DATA_PATH)
 
     spaces_df, spaces_modified = load_data_from_spaces(active_config)
@@ -886,6 +901,8 @@ def render_spaces_settings() -> None:
             else:
                 try:
                     local_df = prepare_data_frame(pd.read_csv(DATA_PATH))
+                except EmptyDataError:
+                    local_df = empty_frame().copy()
                 except Exception:
                     st.error("Could not read local CSV for import.")
                 else:
