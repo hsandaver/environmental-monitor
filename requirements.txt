@@ -1,4 +1,4 @@
-altair
+streamlit>=1.49,<2
+altair>=5,<7
 boto3
 pandas
-streamlit
