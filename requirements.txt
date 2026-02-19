@@ -1,0 +1,4 @@
+altair
+boto3
+pandas
+streamlit
