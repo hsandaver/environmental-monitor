@@ -672,23 +672,23 @@ def load_data() -> pd.DataFrame:
             local_df = empty_frame().copy()
         local_modified = os.path.getmtime(DATA_PATH)
 
-    spaces_df, spaces_modified = load_data_from_spaces(active_config)
+    spaces_df, _ = load_data_from_spaces(active_config)
 
     if spaces_df is None:
         if local_modified is not None and spaces_enabled(active_config):
             save_data_to_spaces(local_df, active_config)
         return local_df
 
-    if local_modified is not None and (spaces_modified is None or local_modified > spaces_modified):
-        save_data_to_spaces(local_df, active_config)
-        return local_df
-
-    if spaces_df is not None:
+    if not spaces_df.empty:
         os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
         spaces_df.to_csv(DATA_PATH, index=False)
         return spaces_df
 
-    return local_df
+    if spaces_df.empty and not local_df.empty:
+        save_data_to_spaces(local_df, active_config)
+        return local_df
+
+    return spaces_df
 
 
 def save_data(df: pd.DataFrame) -> None:
