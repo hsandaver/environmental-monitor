@@ -480,6 +480,19 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def get_location_options(df: pd.DataFrame) -> list[str]:
+    options = list(LOCATIONS)
+    if "location" not in df.columns or df.empty:
+        return options
+    existing_locations = (
+        df["location"].dropna().astype(str).map(str.strip).loc[lambda s: s.ne("")].drop_duplicates().tolist()
+    )
+    for location in existing_locations:
+        if location not in options:
+            options.append(location)
+    return options
+
+
 def default_spaces_config() -> dict[str, str]:
     return {
         "bucket": os.getenv("DO_SPACES_BUCKET", "").strip(),
@@ -603,6 +616,96 @@ def prepare_data_frame(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def parse_tracker_export_csv(csv_bytes: bytes, location: str, source_name: str = "") -> pd.DataFrame:
+    try:
+        text = csv_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = csv_bytes.decode("latin-1", errors="replace")
+
+    lines = text.splitlines()
+    header_idx = None
+    for idx, line in enumerate(lines):
+        parts = [part.strip().lower() for part in line.split(",")]
+        if (
+            len(parts) >= 4
+            and parts[0] == "date"
+            and parts[1] == "time"
+            and "temp" in parts[2]
+            and ("humid" in parts[3] or "rh" in parts[3])
+        ):
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        raise ValueError("Tracker CSV table not found. Expected Date/Time/Temperature/Humidity columns.")
+
+    data_block = "\n".join(lines[header_idx:])
+    try:
+        raw_df = pd.read_csv(io.StringIO(data_block), dtype=str)
+    except Exception as exc:
+        raise ValueError("Tracker CSV table could not be parsed.") from exc
+
+    raw_df.columns = [str(col).strip() for col in raw_df.columns]
+    normalized_cols = {col: col.lower().replace(" ", "") for col in raw_df.columns}
+
+    date_col = next((col for col, norm in normalized_cols.items() if norm == "date"), None)
+    time_col = next((col for col, norm in normalized_cols.items() if norm == "time"), None)
+    temp_col = next((col for col, norm in normalized_cols.items() if "temp" in norm), None)
+    rh_col = next((col for col, norm in normalized_cols.items() if "humid" in norm or norm == "rh"), None)
+
+    if not all([date_col, time_col, temp_col, rh_col]):
+        raise ValueError("Tracker CSV is missing one or more required columns.")
+
+    table_df = raw_df[[date_col, time_col, temp_col, rh_col]].copy()
+    for col in table_df.columns:
+        table_df[col] = table_df[col].astype(str).str.strip()
+
+    table_df = table_df[
+        ~table_df[date_col].str.fullmatch(r"\*+", na=False)
+        & ~table_df[time_col].str.fullmatch(r"\*+", na=False)
+        & table_df[date_col].ne("")
+        & table_df[time_col].ne("")
+    ]
+
+    datetime_text = table_df[date_col] + " " + table_df[time_col]
+    timestamps = pd.to_datetime(datetime_text, format="%m/%d/%Y %H:%M:%S", errors="coerce")
+    fallback_timestamps = pd.to_datetime(datetime_text, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    timestamps = timestamps.fillna(fallback_timestamps)
+
+    parsed_df = pd.DataFrame(
+        {
+            "datetime": timestamps,
+            "temp_c": pd.to_numeric(table_df[temp_col], errors="coerce"),
+            "rh": pd.to_numeric(table_df[rh_col], errors="coerce"),
+        }
+    ).dropna(subset=["datetime", "temp_c", "rh"])
+
+    if parsed_df.empty:
+        raise ValueError("No valid measurement rows were found in the tracker CSV.")
+
+    parsed_df = parsed_df.sort_values("datetime").reset_index(drop=True)
+    note = f"Imported from tracker CSV ({source_name})" if source_name else "Imported from tracker CSV"
+
+    imported_df = pd.DataFrame(
+        {
+            "id": [str(uuid.uuid4()) for _ in range(len(parsed_df))],
+            "datetime": parsed_df["datetime"],
+            "location": location,
+            "temp_c": parsed_df["temp_c"],
+            "rh": parsed_df["rh"],
+            "lux": None,
+            "uv": None,
+            "co2": None,
+            "outside_time": None,
+            "outside_temp_c": None,
+            "outside_rh": None,
+            "outside_dew_point_c": None,
+            "notes": note,
+        }
+    )
+    return imported_df[empty_frame().columns]
 
 
 def load_data_from_spaces(config: Optional[dict[str, str]] = None) -> tuple[Optional[pd.DataFrame], Optional[float]]:
@@ -962,11 +1065,12 @@ with hero_left:
     total_readings = str(len(df))
     last_reading = "--"
     last_location = "--"
+    location_options = get_location_options(df)
     if not df.empty:
         last = df.sort_values("datetime").iloc[-1]
         last_reading = format_dt(last["datetime"])
         last_location = last["location"]
-    locations_covered = f"{df['location'].nunique() if not df.empty else 0}/{len(LOCATIONS)}"
+    locations_covered = f"{df['location'].nunique() if not df.empty else 0}/{len(location_options)}"
     with stats_cols[0]:
         st.markdown(stat_card_html("Total Readings", total_readings), unsafe_allow_html=True)
     with stats_cols[1]:
@@ -1033,8 +1137,16 @@ st.divider()
 with st.expander("Record Measurement", expanded=False):
     with st.form("entry_form", clear_on_submit=False):
         form_left, form_right = st.columns(2)
+        record_location_options = get_location_options(df) + ["Add new area..."]
         with form_left:
-            location = st.selectbox("Location", LOCATIONS)
+            record_location_choice = st.selectbox("Location", record_location_options, key="record_location_choice")
+            record_custom_location = ""
+            if record_location_choice == "Add new area...":
+                record_custom_location = st.text_input(
+                    "New area name",
+                    key="record_new_location",
+                    placeholder="e.g., Office",
+                )
             date_value = st.date_input("Date", value=date.today())
             time_value = st.time_input("Time", value=datetime.now().time().replace(second=0, microsecond=0))
             temp_c = st.number_input("Temperature (C)", min_value=-10.0, max_value=50.0, value=20.0, step=0.1)
@@ -1047,69 +1159,152 @@ with st.expander("Record Measurement", expanded=False):
         submitted = st.form_submit_button("Record Reading", width="stretch")
 
 if submitted:
-    outside_snapshot = fetch_outside_conditions(OUTSIDE_LAT, OUTSIDE_LON, OUTSIDE_TZ)
-    new_row = {
-        "id": str(uuid.uuid4()),
-        "datetime": datetime.combine(date_value, time_value),
-        "location": location,
-        "temp_c": temp_c,
-        "rh": rh,
-        "lux": lux,
-        "uv": uv,
-        "co2": co2,
-        "outside_time": outside_snapshot.get("time") if outside_snapshot else None,
-        "outside_temp_c": outside_snapshot.get("temp_c") if outside_snapshot else None,
-        "outside_rh": outside_snapshot.get("rh") if outside_snapshot else None,
-        "outside_dew_point_c": outside_snapshot.get("dew_point_c") if outside_snapshot else None,
-        "notes": notes.strip(),
-    }
-    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-    save_data(df)
-    st.success("Measurement recorded.")
+    target_location = (
+        record_custom_location.strip() if record_location_choice == "Add new area..." else record_location_choice
+    )
+    if not target_location:
+        st.warning("Enter a name for the new area before recording.")
+    else:
+        outside_snapshot = fetch_outside_conditions(OUTSIDE_LAT, OUTSIDE_LON, OUTSIDE_TZ)
+        new_row = {
+            "id": str(uuid.uuid4()),
+            "datetime": datetime.combine(date_value, time_value),
+            "location": target_location,
+            "temp_c": temp_c,
+            "rh": rh,
+            "lux": lux,
+            "uv": uv,
+            "co2": co2,
+            "outside_time": outside_snapshot.get("time") if outside_snapshot else None,
+            "outside_temp_c": outside_snapshot.get("temp_c") if outside_snapshot else None,
+            "outside_rh": outside_snapshot.get("rh") if outside_snapshot else None,
+            "outside_dew_point_c": outside_snapshot.get("dew_point_c") if outside_snapshot else None,
+            "notes": notes.strip(),
+        }
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        save_data(df)
+        st.success("Measurement recorded.")
 
+with st.expander("Import Tracker CSV", expanded=False):
+    st.caption("Upload logger exports with Date/Time/Temperature/Humidity columns.")
+    with st.form("tracker_import_form", clear_on_submit=False):
+        import_location_options = get_location_options(df) + ["Add new area..."]
+        import_location_choice = st.selectbox(
+            "Assign imported rows to location",
+            import_location_options,
+            key="tracker_import_location",
+        )
+        import_custom_location = ""
+        if import_location_choice == "Add new area...":
+            import_custom_location = st.text_input(
+                "New area name for import",
+                key="tracker_import_new_location",
+                placeholder="e.g., Office",
+            )
+        uploaded_tracker_file = st.file_uploader(
+            "Tracker CSV file",
+            type=["csv"],
+            key="tracker_import_file",
+        )
+        replace_existing = st.checkbox(
+            "Replace existing readings with the same location + timestamp",
+            value=True,
+            help="If enabled, imported rows overwrite existing rows at matching location and datetime.",
+            key="tracker_replace_existing",
+        )
+        import_submitted = st.form_submit_button("Import Tracker CSV", width="stretch")
+
+if import_submitted:
+    target_import_location = (
+        import_custom_location.strip() if import_location_choice == "Add new area..." else import_location_choice
+    )
+    if not target_import_location:
+        st.warning("Enter a name for the import area before importing.")
+    elif uploaded_tracker_file is None:
+        st.warning("Choose a CSV file to import.")
+    else:
+        try:
+            imported_df = parse_tracker_export_csv(
+                uploaded_tracker_file.getvalue(),
+                location=target_import_location,
+                source_name=uploaded_tracker_file.name,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception:
+            st.error("Could not import tracker CSV. Please verify the file format.")
+        else:
+            existing_keys = set(zip(df["location"], pd.to_datetime(df["datetime"], errors="coerce")))
+            imported_keys = set(
+                zip(imported_df["location"], pd.to_datetime(imported_df["datetime"], errors="coerce"))
+            )
+            replaced_count = len(existing_keys & imported_keys)
+            new_count = len(imported_keys - existing_keys)
+
+            merged_df = pd.concat([df, imported_df], ignore_index=True)
+            if replace_existing:
+                merged_df = (
+                    merged_df.sort_values("datetime")
+                    .drop_duplicates(subset=["location", "datetime"], keep="last")
+                    .reset_index(drop=True)
+                )
+            merged_df = prepare_data_frame(merged_df)
+            save_data(merged_df)
+            df = merged_df
+
+            if replace_existing:
+                st.success(
+                    f"Imported {len(imported_df)} rows ({new_count} new, {replaced_count} replaced)."
+                )
+            else:
+                st.success(f"Imported {len(imported_df)} rows.")
+
+location_options = get_location_options(df)
 df_eval = evaluate_records(df)
 
 st.subheader("Current Status")
-status_cols = st.columns(4)
-for col, location in zip(status_cols, LOCATIONS):
-    target = df_eval[df_eval["location"] == location]
-    with col:
-        if target.empty:
+for start in range(0, len(location_options), 4):
+    row_locations = location_options[start : start + 4]
+    status_cols = st.columns(len(row_locations))
+    for col, location in zip(status_cols, row_locations):
+        target = df_eval[df_eval["location"] == location]
+        with col:
+            if target.empty:
+                st.markdown(
+                    f"""
+                    <div class="status-card state-awaiting">
+                        <div class="status-card-title">{location}</div>
+                        <div class="status-card-meta">No readings yet.</div>
+                        <span class="chip awaiting">Awaiting</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                continue
+            latest = target.sort_values("datetime").iloc[-1]
+            flags_html = flags_to_html(latest["flags"])
+            delta_line = ""
+            if outside_data and outside_data.get("temp_c") is not None and outside_data.get("rh") is not None:
+                delta_temp = latest["temp_c"] - outside_data["temp_c"]
+                delta_rh = latest["rh"] - outside_data["rh"]
+                delta_line = (
+                    f'<div class="status-card-delta">'
+                    f'Delta vs outside: {delta_temp:+.1f} C / {delta_rh:+.1f}% RH'
+                    f"</div>"
+                )
             st.markdown(
                 f"""
-                <div class="status-card state-awaiting">
+                <div class="status-card state-{latest["range_status"]}">
                     <div class="status-card-title">{location}</div>
-                    <div class="status-card-meta">No readings yet.</div>
-                    <span class="chip awaiting">Awaiting</span>
+                    <div class="status-card-meta">{format_dt(latest["datetime"])}</div>
+                    <div class="status-card-reading">{latest["temp_c"]:.1f} C  /  {latest["rh"]:.1f}% RH</div>
+                    {delta_line}
+                    {status_chip(latest["range_status"])}
+                    <div class="status-flags">{flags_html}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            continue
-        latest = target.sort_values("datetime").iloc[-1]
-        flags_html = flags_to_html(latest["flags"])
-        delta_line = ""
-        if outside_data and outside_data.get("temp_c") is not None and outside_data.get("rh") is not None:
-            delta_temp = latest["temp_c"] - outside_data["temp_c"]
-            delta_rh = latest["rh"] - outside_data["rh"]
-            delta_line = (
-                f'<div class="status-card-delta">'
-                f'Delta vs outside: {delta_temp:+.1f} C / {delta_rh:+.1f}% RH'
-                f"</div>"
-            )
-        st.markdown(
-            f"""
-            <div class="status-card state-{latest["range_status"]}">
-                <div class="status-card-title">{location}</div>
-                <div class="status-card-meta">{format_dt(latest["datetime"])}</div>
-                <div class="status-card-reading">{latest["temp_c"]:.1f} C  /  {latest["rh"]:.1f}% RH</div>
-                {delta_line}
-                {status_chip(latest["range_status"])}
-                <div class="status-flags">{flags_html}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
 st.divider()
 
@@ -1117,7 +1312,7 @@ trend_tab, table_tab = st.tabs(["Trend Analysis", "Recorded Measurements"])
 
 with trend_tab:
     st.subheader("Trend Analysis")
-    location_choice = st.selectbox("Location", LOCATIONS, key="trend_location")
+    location_choice = st.selectbox("Location", location_options, key="trend_location")
     location_df = df_eval[df_eval["location"] == location_choice].sort_values("datetime")
     if location_df.shape[0] < 2:
         st.info("Add at least two readings to see a trend line.")
@@ -1259,7 +1454,7 @@ with trend_tab:
 
 with table_tab:
     st.subheader("Recorded Measurements")
-    filter_loc = st.selectbox("Filter", ["All Locations"] + LOCATIONS, key="table_filter")
+    filter_loc = st.selectbox("Filter", ["All Locations"] + location_options, key="table_filter")
     table_df = df_eval.copy()
     if filter_loc != "All Locations":
         table_df = table_df[table_df["location"] == filter_loc]
