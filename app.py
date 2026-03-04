@@ -44,6 +44,7 @@ OUTSIDE_LAT = -37.813
 OUTSIDE_LON = 144.985
 OUTSIDE_TZ = "Australia/Melbourne"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OUTSIDE_TEMP_DELTA_WARN = 6.0
 OUTSIDE_RH_DELTA_WARN = 15.0
 
@@ -855,6 +856,95 @@ def fetch_outside_conditions(lat: float, lon: float, timezone: str) -> Optional[
     }
 
 
+@st.cache_data(show_spinner=False, ttl=21600)
+def fetch_outside_history(lat: float, lon: float, timezone: str, start_date: str, end_date: str) -> pd.DataFrame:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,relative_humidity_2m",
+        "timezone": timezone,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    url = f"{OPEN_METEO_ARCHIVE_URL}?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=12) as response:
+            if response.status != 200:
+                return pd.DataFrame(columns=["datetime", "outside_temp_c", "outside_rh"])
+            data = json.load(response)
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "outside_temp_c", "outside_rh"])
+
+    hourly = data.get("hourly") or {}
+    timestamps = pd.to_datetime(hourly.get("time"), errors="coerce")
+    outside_df = pd.DataFrame(
+        {
+            "datetime": timestamps,
+            "outside_temp_c": pd.to_numeric(hourly.get("temperature_2m"), errors="coerce"),
+            "outside_rh": pd.to_numeric(hourly.get("relative_humidity_2m"), errors="coerce"),
+        }
+    ).dropna(subset=["datetime"])
+    if outside_df.empty:
+        return pd.DataFrame(columns=["datetime", "outside_temp_c", "outside_rh"])
+    return outside_df.sort_values("datetime").reset_index(drop=True)
+
+
+def enrich_with_outside_history(
+    df: pd.DataFrame,
+    lat: float,
+    lon: float,
+    timezone: str,
+    tolerance: str = "90min",
+) -> pd.DataFrame:
+    if df.empty or "datetime" not in df.columns:
+        return df
+
+    working = df.copy().sort_values("datetime").reset_index(drop=True)
+    working["datetime"] = pd.to_datetime(working["datetime"], errors="coerce")
+    valid_rows = working["datetime"].notna()
+    if not valid_rows.any():
+        return working
+
+    start_dt = working.loc[valid_rows, "datetime"].min()
+    end_dt = working.loc[valid_rows, "datetime"].max()
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        return working
+
+    outside_history = fetch_outside_history(
+        lat,
+        lon,
+        timezone,
+        start_dt.date().isoformat(),
+        end_dt.date().isoformat(),
+    )
+    if outside_history.empty:
+        return working
+
+    matched = pd.DataFrame(index=working.index, columns=["outside_temp_c", "outside_rh"], dtype="float64")
+    matched_valid = pd.merge_asof(
+        working.loc[valid_rows, ["datetime"]],
+        outside_history,
+        on="datetime",
+        direction="nearest",
+        tolerance=pd.Timedelta(tolerance),
+    )
+    matched.loc[valid_rows, "outside_temp_c"] = matched_valid["outside_temp_c"].to_numpy()
+    matched.loc[valid_rows, "outside_rh"] = matched_valid["outside_rh"].to_numpy()
+
+    for col in ["outside_temp_c", "outside_rh"]:
+        existing = (
+            pd.to_numeric(working.get(col), errors="coerce")
+            if col in working.columns
+            else pd.Series(index=working.index, dtype="float64")
+        )
+        if existing.empty:
+            working[col] = matched[col]
+        else:
+            working[col] = existing.where(existing.notna(), matched[col])
+
+    return working
+
+
 def evaluate_records(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1319,6 +1409,7 @@ with trend_tab:
     else:
         chart_df = location_df.copy()
         chart_df["datetime"] = pd.to_datetime(chart_df["datetime"])
+        chart_df = enrich_with_outside_history(chart_df, OUTSIDE_LAT, OUTSIDE_LON, OUTSIDE_TZ)
 
         temp_long = (
             chart_df.melt(
